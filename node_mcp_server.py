@@ -31,6 +31,18 @@ _NPM_NAME_RE = re.compile(
     r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[A-Za-z0-9._\-+~^*<>=]+)?$"
 )
 
+# Valid JS identifier, used for component names that become filenames.
+_JS_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _resolve_in_project(project_path: str, file_path: str) -> Optional[str]:
+    """Resolve file_path relative to project_path, refusing paths that escape it."""
+    resolved = os.path.realpath(os.path.join(project_path, file_path))
+    root = os.path.realpath(project_path)
+    if resolved == root or resolved.startswith(root + os.sep):
+        return resolved
+    return None
+
 # Context class for our Node.js MCP server
 @dataclass
 class NodeAppContext:
@@ -73,12 +85,12 @@ async def node_app_lifespan(server: FastMCP) -> AsyncIterator[NodeAppContext]:
                 # Load package.json
                 try:
                     with open(os.path.join(current_dir, "package.json"), "r") as f:
-                        context.package_json = json.load(f)
-                        
-                    # Extract dependencies
-                    context.dependencies = context.package_json.get("dependencies", {})
-                    context.dev_dependencies = context.package_json.get("devDependencies", {})
-                    
+                        package_json = json.load(f)
+
+                    context.package_json = package_json
+                    context.dependencies = package_json.get("dependencies", {})
+                    context.dev_dependencies = package_json.get("devDependencies", {})
+
                     print(f"Found Node.js project at: {current_dir}")
                 except Exception as e:
                     print(f"Error reading package.json: {e}")
@@ -94,9 +106,9 @@ async def node_app_lifespan(server: FastMCP) -> AsyncIterator[NodeAppContext]:
 
 # Create MCP server
 mcp = FastMCP(
-    "Enhanced Node.js Assistant", 
+    "Enhanced Node.js Assistant",
     lifespan=node_app_lifespan,
-    dependencies=["requests", "packaging"]
+    dependencies=["httpx"],
 )
 
 # =========== RESOURCES ===========
@@ -284,7 +296,7 @@ async def install_package(package_name: str, ctx: Context, dev: bool = False) ->
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180)
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=180)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -405,12 +417,15 @@ async def run_npm_script(script_name: str, ctx: Context, timeout_seconds: int = 
     return f"Error running script {script_name!r} (exit {process.returncode}):\n\n{error or output}"
 
 @mcp.tool()
-def create_react_component(name: str, ctx: Context, props: List[str] = None, typescript: bool = False, functional: bool = True) -> str:
+def create_react_component(name: str, ctx: Context, props: Optional[List[str]] = None, typescript: bool = False, functional: bool = True) -> str:
     """Generate a React component file"""
     node_ctx = ctx.request_context.lifespan_context
-    
+
     if not node_ctx.project_path:
         return "Error: No Node.js project found. Please run this in a directory with a package.json file."
+
+    if not _JS_IDENT_RE.match(name):
+        return f"Error: invalid component name {name!r}. Use a valid JavaScript identifier (e.g. MyComponent)."
     
     # Format props
     formatted_props = ""
@@ -680,19 +695,20 @@ def create_test_file(file_path: str, ctx: Context, framework: str = "jest") -> s
     
     if not node_ctx.project_path:
         return "Error: No Node.js project found. Please run this in a directory with a package.json file."
-    
-    # Validate file path
-    full_file_path = os.path.join(node_ctx.project_path, file_path)
+
+    # Validate file path (must stay inside the project root)
+    full_file_path = _resolve_in_project(node_ctx.project_path, file_path)
+    if full_file_path is None:
+        return f"Error: {file_path} is outside the project directory."
     if not os.path.exists(full_file_path):
         return f"Error: File {file_path} not found."
-    
+
     # Determine file type (js, jsx, ts, tsx)
     _, ext = os.path.splitext(file_path)
     is_typescript = ext.lower() in ['.ts', '.tsx']
     is_react = ext.lower() in ['.jsx', '.tsx']
     
     # Create test file path
-    file_dir = os.path.dirname(file_path)
     file_name = os.path.basename(file_path)
     base_name, _ = os.path.splitext(file_name)
     
@@ -780,7 +796,7 @@ def create_test_file(file_path: str, ctx: Context, framework: str = "jest") -> s
                 f"}});\n"
             )
     
-    elif framework == 'vitest':
+    else:  # vitest — framework already validated against the supported list above
         test_file_name = f"{base_name}.test{ext}"
         test_file_path = os.path.join(tests_dir, test_file_name)
         
@@ -1201,7 +1217,7 @@ def create_performance_test(ctx: Context, endpoint: str, method: str = "GET", re
     
     # Create k6 performance test script
     k6_script = f"""import http from 'k6/http';
-import { sleep, check } from 'k6';
+import {{ sleep, check }} from 'k6';
 
 export const options = {{
   scenarios: {{
@@ -2324,12 +2340,14 @@ def convert_to_typescript(file_path: str, ctx: Context) -> str:
     
     if not node_ctx.project_path:
         return "Error: No Node.js project found. Please run this in a directory with a package.json file."
-    
-    # Validate file path
-    full_file_path = os.path.join(node_ctx.project_path, file_path)
+
+    # Validate file path (must stay inside the project root)
+    full_file_path = _resolve_in_project(node_ctx.project_path, file_path)
+    if full_file_path is None:
+        return f"Error: {file_path} is outside the project directory."
     if not os.path.exists(full_file_path):
         return f"Error: File {file_path} not found."
-    
+
     # Check if it's a JavaScript file
     _, ext = os.path.splitext(file_path)
     if ext.lower() not in ['.js', '.jsx']:
@@ -2358,50 +2376,62 @@ def convert_to_typescript(file_path: str, ctx: Context) -> str:
             ts_code
         )
     
-    # 2. Add basic Function type annotations
+    # 2. Type React functional components. This must run BEFORE the generic
+    #    annotations below — those rewrite the very signatures these patterns
+    #    match (e.g. "(props) =>" becomes "(props): any =>").
+    if is_react:
+        component_match = re.search(
+            r'export\s+default\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\('
+            r'|const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\([^)]*\)\s*=>',
+            ts_code
+        )
+        if component_match and re.search(r'return\s*[(<]', ts_code):
+            component_name = component_match.group(1) or component_match.group(2)
+
+            if 'import React' not in ts_code:
+                ts_code = "import React from 'react';\n" + ts_code
+
+            # Insert a Props interface after the last import line
+            lines = ts_code.split('\n')
+            insert_at = 0
+            for i, line in enumerate(lines):
+                if line.startswith('import'):
+                    insert_at = i + 1
+            lines.insert(insert_at, f"\ninterface {component_name}Props {{\n  // TODO: Define props types here\n}}")
+            ts_code = '\n'.join(lines)
+
+            # const Name = (props) => {  ->  const Name: React.FC<NameProps> = (props) => {
+            ts_code = re.sub(
+                rf'const\s+{component_name}\s*=\s*\(\s*([^)]*?)\s*\)\s*=>\s*{{',
+                rf'const {component_name}: React.FC<{component_name}Props> = (\1) => {{',
+                ts_code
+            )
+
+            # export default function Name(props) {  ->  ...(props: NameProps): JSX.Element {
+            def _annotate_component_fn(match: "re.Match[str]") -> str:
+                params = match.group(2).strip()
+                typed = f"{params}: {component_name}Props" if params else ""
+                return f"{match.group(1)}({typed}): JSX.Element {{"
+
+            ts_code = re.sub(
+                rf'(export\s+default\s+function\s+{component_name})\s*\(\s*([^)]*)\s*\)\s*{{',
+                _annotate_component_fn,
+                ts_code
+            )
+
+    # 3. Add basic function type annotations (skips signatures already typed above)
     ts_code = re.sub(
         r'function\s+([a-zA-Z0-9_]+)\s*\(\s*([^)]*)\s*\)\s*{',
         r'function \1(\2): any {',
         ts_code
     )
-    
-    # 3. Add basic types for arrow functions
+
+    # 4. Add basic types for arrow functions
     ts_code = re.sub(
         r'const\s+([a-zA-Z0-9_]+)\s*=\s*\(\s*([^)]*)\s*\)\s*=>\s*{',
         r'const \1 = (\2): any => {',
         ts_code
     )
-    
-    # 4. Add React-specific typing for functional components
-    if is_react:
-        # Check if it looks like a React functional component
-        if re.search(r'(export\s+default\s+function|const\s+\w+\s*=\s*\([^)]*\)\s*=>)\s*{[^}]*return\s*\(', ts_code):
-            # Add React import if not already there
-            if 'import React' not in ts_code:
-                ts_code = 'import React from \'react\';\n' + ts_code
-            
-            # Add FC type
-            ts_code = re.sub(
-                r'(export\s+default\s+function\s+([a-zA-Z0-9_]+))\s*\(\s*([^)]*)\s*\)\s*{',
-                r'\1(\3): React.FC {',
-                ts_code
-            )
-            ts_code = re.sub(
-                r'(const\s+([a-zA-Z0-9_]+)\s*=\s*)\(\s*([^)]*)\s*\)\s*=>\s*{',
-                r'\1React.FC<{\3}> = (\3) => {',
-                ts_code
-            )
-            
-            # Add props interface if it looks like it takes props
-            if 'props' in ts_code:
-                # Add props interface
-                interface_pos = ts_code.find('import') != -1 and ts_code.find('import') + ts_code[ts_code.find('import'):].find('\n') + 1 or 0
-                component_name = re.search(r'(function|const)\s+([a-zA-Z0-9_]+)', ts_code).group(2)
-                ts_code = ts_code[:interface_pos] + f"\ninterface {component_name}Props {{\n  // TODO: Define props types here\n}}\n" + ts_code[interface_pos:]
-                
-                # Update component to use the interface
-                ts_code = ts_code.replace(f"React.FC<{{", f"React.FC<{component_name}Props")
-                ts_code = ts_code.replace(f"React.FC {{", f"React.FC<{component_name}Props> {{")
     
     # Write the TypeScript code to the output file
     with open(output_path, 'w') as f:

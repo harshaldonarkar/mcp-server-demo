@@ -44,7 +44,7 @@ To register a server with Claude Desktop:
 uv run mcp install server.py
 ```
 
-> **Note:** servers that declare `dependencies=[...]` on `FastMCP(...)` (e.g. `httpx`, `requests`) declare them for the isolated environment that `mcp install` creates. For `uv run` you must also add them to `pyproject.toml` via `uv add`.
+> **Note:** the `dependencies=[...]` argument to `FastMCP(...)` (used by `node_mcp_server.py` for `httpx`) only applies to the isolated environment that `mcp install` creates. For `uv run`, runtime deps live in `pyproject.toml` — already set up here via `uv sync`.
 
 ## Project layout
 
